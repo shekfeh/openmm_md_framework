@@ -1,0 +1,9 @@
+Requirements:
+
+* openmm
+* ambertools
+* parmed
+* mdtraj
+
+
+python openmm_generate_script.py -i complex_solvated.inpcrd -t complex_solvated.prmtop minim nvt npt md
