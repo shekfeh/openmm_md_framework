@@ -1,248 +1,292 @@
 #!/usr/bin/env python3
-# title           :openmm_prep.py
-# description     :Prepare and serialize an OpenMM system from Amber topology and coordinates.
-# date            :2024-11-20
-# python_version  :3.x
-# usage           :python openmm_prep.py -h
-# ==============================================================================
+"""Prepare and minimize an OpenMM system from Amber files or PDB+OpenMM force fields.
 
-import os
-import math
-from argparse import ArgumentParser
+Typical Amber usage:
+    python openmm_prep.py -t complex.prmtop -i complex.inpcrd \
+        --system-xml system.xml --min-state sys_min.xml \
+        --longrange PME --cutoff 10.0 --shake \
+        --restrain-mask '!:WAT&!@H=' --reference prot_amber.pdb -k 10.0
+"""
 
-import parmed as pmd
-from parmed import unit as u
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+
 import openmm as mm
 import openmm.app as app
-from openmm.app.internal.unitcell import computeLengthsAndAngles
-from collections import defaultdict
+from openmm import unit as u
+
+try:
+    import parmed as pmd
+except ImportError:  # pragma: no cover
+    pmd = None
+
+LOGGER = logging.getLogger("openmm_prep")
+
+KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2 = 418.4
 
 
-def perform_minimization(system, positions, topology, step_number):
-    """
-    Perform energy minimization on the given system.
-    Args:
-        system: OpenMM System object.
-        positions: Initial positions of the system.
-        topology: Topology of the system.
-        step_number: Current minimization cycle number.
-    """
-    integrator = mm.VerletIntegrator(0.001)  # Dummy integrator for minimization
-    platform = mm.Platform.getPlatformByName("CPU")
-    simulation = app.Simulation(topology, system, integrator, platform)
-
-    simulation.context.setPositions(positions)
-    simulation.minimizeEnergy()
-
-    # Get minimized energy
-    state = simulation.context.getState(getEnergy=True, getPositions=True)
-    energy = state.getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)
-    print(f"Step {step_number}: Minimized energy = {energy:.4f} kcal/mol")
-
-    return state.getPositions()
-
-
-def main():
-    # Command-line arguments
-    parser = ArgumentParser(
-        description="Prepare and serialize an OpenMM system from Amber files or PDB+forcefield."
+def setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    input_group = parser.add_argument_group("Input Files")
-    input_group.add_argument(
-        "-p",
-        "--pdb",
-        metavar="<PDB FILE>",
-        help="PDB file for the target system (optional if using Amber files).",
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create an OpenMM System XML and minimized State XML."
     )
-    input_group.add_argument(
-        "-t",
-        "--topology",
-        metavar="<TOP FILE>",
-        help="Amber topology file (required for Amber inputs).",
-    )
-    input_group.add_argument(
-        "-i",
-        "--inpcrd",
-        metavar="<CRD FILE>",
-        help="Amber coordinate file (required for Amber inputs).",
-    )
+
+    input_group = parser.add_argument_group("Input files")
+    input_group.add_argument("-t", "--topology", help="Amber topology/prmtop file.")
+    input_group.add_argument("-i", "--inpcrd", help="Amber coordinate/inpcrd file.")
+    input_group.add_argument("-p", "--pdb", help="PDB file for PDB+ForceField mode.")
     input_group.add_argument(
         "-f",
         "--forcefield",
-        metavar="<FORCEFIELD FILE>",
         nargs="+",
-        default=["amoeba2013"],
-        help="Forcefield XML files (required for PDB inputs). Default: amoeba2013.",
+        default=None,
+        help="OpenMM force-field XML files for PDB mode, e.g. amber14-all.xml amber14/tip3pfb.xml.",
     )
 
-    output_group = parser.add_argument_group("Output Options")
+    output_group = parser.add_argument_group("Output files")
     output_group.add_argument(
-        "-s",
         "--system-xml",
-        metavar="OUTPUT FILE",
         default="system.xml",
-        help="Output OpenMM system XML file. Default: system.xml.",
+        help="Output serialized OpenMM System XML.",
+    )
+    output_group.add_argument(
+        "--min-state", default="sys_min.xml", help="Output minimized State XML."
     )
 
-    simulation_group = parser.add_argument_group("Simulation Settings")
-    simulation_group.add_argument(
-        "--cuda",
-        metavar="CUDA DEVICE",
-        default="0",
-        help="CUDA device index to use (default: 0).",
-    )
-    simulation_group.add_argument(
-        "--shake",
-        action="store_true",
-        default=False,
-        help="Apply SHAKE constraints to hydrogen bonds. Default: off.",
-    )
-    simulation_group.add_argument(
+    sim_group = parser.add_argument_group("System settings")
+    sim_group.add_argument(
         "-l",
         "--longrange",
-        choices=["Ewald", "PME", "NoCutoff"],
+        choices=["PME", "Ewald", "NoCutoff"],
         default="PME",
-        help="Method for long-range electrostatics (default: PME).",
+        help="Long-range electrostatics method.",
     )
-    simulation_group.add_argument(
+    sim_group.add_argument(
         "-c",
         "--cutoff",
-        metavar="CUTOFF",
         type=float,
         default=10.0,
-        help="Non-bonded interaction cutoff distance in Angstroms (default: 10.0).",
+        help="Nonbonded cutoff in Angstrom.",
     )
-    simulation_group.add_argument(
+    sim_group.add_argument(
         "-e",
-        "--ewaldTolerance",
-        metavar="TOLERANCE",
+        "--ewald-tolerance",
         type=float,
         default=5e-4,
-        help="Ewald error tolerance for PME (default: 5e-4).",
+        help="PME/Ewald error tolerance.",
     )
-    simulation_group.add_argument(
-        "-v",
-        "--vdw-cutoff",
-        metavar="CUTOFF",
+    sim_group.add_argument(
+        "--shake",
+        action="store_true",
+        help="Constrain bonds involving hydrogen and use rigid water.",
+    )
+    sim_group.add_argument(
+        "--min-cycles", type=int, default=3, help="Number of minimization cycles."
+    )
+    sim_group.add_argument(
+        "--min-tolerance",
         type=float,
-        help="Cutoff for van der Waals interactions (AMOEBA forcefields only).",
+        default=10.0,
+        help="Minimization tolerance in kJ/mol/nm.",
     )
-    simulation_group.add_argument(
-        "--epsilon",
-        metavar="EPSILON",
-        type=float,
-        help="Convergence criteria for polarizable dipoles (AMOEBA only).",
+    sim_group.add_argument(
+        "--max-iterations",
+        type=int,
+        default=0,
+        help="Max minimizer iterations per cycle; 0 lets OpenMM choose.",
     )
+    sim_group.add_argument(
+        "--platform",
+        choices=["CUDA", "OpenCL", "CPU"],
+        default="CPU",
+        help="Platform used for minimization.",
+    )
+    sim_group.add_argument("--cuda", default="0", help="CUDA device index.")
+    sim_group.add_argument("--opencl", default="0", help="OpenCL device index.")
 
-    restraint_group = parser.add_argument_group("Restraints and Repulsion")
-    restraint_group.add_argument(
-        "--reference",
-        metavar="<PDB FILE>",
-        help="Reference PDB for positional restraints.",
-    )
+    restraint_group = parser.add_argument_group("Optional positional restraints")
     restraint_group.add_argument(
         "--restrain-mask",
-        metavar="<MASK>",
-        help="Amber mask for positional restraints.",
+        help="Amber mask for restrained atoms, e.g. '!:WAT&!@H='. Requires Amber topology.",
     )
     restraint_group.add_argument(
-        "--repulsion-mask",
-        metavar="<MASK>",
-        help="Amber mask for repulsion restraints.",
+        "--reference",
+        help="Reference PDB or coordinate file with atom order matching the system.",
     )
     restraint_group.add_argument(
         "-k",
         "--force-constant",
-        metavar="FORCE CONSTANT",
         type=float,
         default=10.0,
-        help="Force constant for positional restraints (default: 10.0 kcal/mol/A^2).",
+        help="Positional restraint force constant in kcal/mol/A^2.",
     )
 
-    opt = parser.parse_args()
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
+    return parser.parse_args()
 
-    # Determine non-bonded method
-    longrange_method = {"PME": app.PME, "Ewald": app.Ewald, "NoCutoff": app.NoCutoff}[
+
+def get_platform(name: str, cuda: str = "0", opencl: str = "0"):
+    platform = mm.Platform.getPlatformByName(name)
+    if name == "CUDA":
+        return platform, {"CudaPrecision": "mixed", "CudaDeviceIndex": cuda}
+    if name == "OpenCL":
+        return platform, {"OpenCLDeviceIndex": opencl}
+    return platform, {}
+
+
+def load_reference_positions(path: str):
+    suffix = Path(path).suffix.lower()
+    if suffix in {".pdb", ".ent"}:
+        return app.PDBFile(path).positions
+    if suffix in {".rst7", ".inpcrd", ".crd"}:
+        return app.AmberInpcrdFile(path).positions
+    raise ValueError("Reference must be PDB/ENT or Amber inpcrd/rst7.")
+
+
+def amber_mask_indices(
+    topology_file: str, coordinate_file: str, mask: str
+) -> list[int]:
+    if pmd is None:
+        raise RuntimeError("ParmEd is required for --restrain-mask selection.")
+    structure = pmd.load_file(topology_file, coordinate_file)
+    selection = structure[mask]
+    return [atom.idx for atom in selection.atoms]
+
+
+def add_positional_restraints(
+    system: mm.System,
+    indices: list[int],
+    reference_positions,
+    force_constant_kcal_per_mol_a2: float,
+) -> None:
+    if not indices:
+        raise ValueError("Restraint mask selected zero atoms.")
+    if len(reference_positions) < system.getNumParticles():
+        raise ValueError("Reference has fewer atoms than the OpenMM system.")
+
+    k = force_constant_kcal_per_mol_a2 * KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2
+    force = mm.CustomExternalForce("0.5*k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    force.addGlobalParameter("k", k * u.kilojoule_per_mole / u.nanometer**2)
+    force.addPerParticleParameter("x0")
+    force.addPerParticleParameter("y0")
+    force.addPerParticleParameter("z0")
+
+    for idx in indices:
+        pos = reference_positions[idx].value_in_unit(u.nanometer)
+        force.addParticle(idx, [pos.x, pos.y, pos.z])
+
+    system.addForce(force)
+    LOGGER.info(
+        "Added positional restraints to %d atoms (k=%g kcal/mol/A^2).",
+        len(indices),
+        force_constant_kcal_per_mol_a2,
+    )
+
+
+def build_system(opt: argparse.Namespace):
+    method = {"PME": app.PME, "Ewald": app.Ewald, "NoCutoff": app.NoCutoff}[
         opt.longrange
     ]
-
     constraints = app.HBonds if opt.shake else None
+    cutoff = opt.cutoff * u.angstrom
 
-    # Load system
     if opt.topology and opt.inpcrd:
-        print(f"Loading Amber files: {opt.topology}, {opt.inpcrd}")
+        LOGGER.info("Loading Amber files: %s, %s", opt.topology, opt.inpcrd)
         prmtop = app.AmberPrmtopFile(opt.topology)
         inpcrd = app.AmberInpcrdFile(opt.inpcrd)
         system = prmtop.createSystem(
-            nonbondedMethod=longrange_method,
-            nonbondedCutoff=opt.cutoff * u.angstroms,
-            rigidWater=opt.shake,
+            nonbondedMethod=method,
+            nonbondedCutoff=cutoff,
             constraints=constraints,
-            ewaldErrorTolerance=opt.ewaldTolerance,
+            rigidWater=opt.shake,
+            ewaldErrorTolerance=opt.ewald_tolerance,
         )
-        pos = inpcrd.positions
-        top = prmtop.topology
-
+        if inpcrd.boxVectors is not None:
+            system.setDefaultPeriodicBoxVectors(*inpcrd.boxVectors)
+        topology = prmtop.topology
+        positions = inpcrd.positions
     elif opt.pdb and opt.forcefield:
-        print(f"Loading PDB file: {opt.pdb}")
+        LOGGER.info("Loading PDB file: %s", opt.pdb)
         pdb = app.PDBFile(opt.pdb)
-        forcefields = [
-            f"{ff}.xml" if not ff.endswith(".xml") else ff for ff in opt.forcefield
-        ]
-        ff = app.ForceField(*forcefields)
-        kwargs = {
-            "nonbondedMethod": longrange_method,
-            "nonbondedCutoff": opt.cutoff * u.angstroms,
-            "rigidWater": opt.shake,
-            "constraints": constraints,
-            "ewaldErrorTolerance": opt.ewaldTolerance,
-        }
-        if opt.epsilon:
-            kwargs.update(
-                {"polarization": "mutual", "mutualInducedTargetEpsilon": opt.epsilon}
-            )
-        system = ff.createSystem(pdb.topology, **kwargs)
-        pos = pdb.positions
-        top = pdb.topology
+        forcefield = app.ForceField(*opt.forcefield)
+        system = forcefield.createSystem(
+            pdb.topology,
+            nonbondedMethod=method,
+            nonbondedCutoff=cutoff,
+            constraints=constraints,
+            rigidWater=opt.shake,
+            ewaldErrorTolerance=opt.ewald_tolerance,
+        )
+        topology = pdb.topology
+        positions = pdb.positions
     else:
-        raise ValueError(
-            "Specify either Amber files (-t and -i) or a PDB file (-p) with forcefield (-f)."
+        raise ValueError("Use either Amber mode (-t/-i) or PDB mode (-p/-f).")
+
+    if opt.restrain_mask:
+        if not (opt.topology and opt.inpcrd):
+            raise ValueError("--restrain-mask currently requires Amber mode (-t/-i).")
+        if not opt.reference:
+            raise ValueError("--reference is required when --restrain-mask is used.")
+        indices = amber_mask_indices(opt.topology, opt.inpcrd, opt.restrain_mask)
+        reference_positions = load_reference_positions(opt.reference)
+        add_positional_restraints(
+            system, indices, reference_positions, opt.force_constant
         )
 
-    # Apply van der Waals cutoff for AMOEBA
-    if opt.vdw_cutoff:
-        for force in system.getForces():
-            if isinstance(force, mm.AmoebaVdwForce):
-                print(f"Setting van der Waals cutoff to {opt.vdw_cutoff} Å.")
-                force.setCutoff(opt.vdw_cutoff * u.angstroms)
+    return system, topology, positions
 
-    # Serialize the system
-    print(f"Writing system XML to {opt.system_xml}")
-    with open(opt.system_xml, "w") as f:
-        f.write(mm.XmlSerializer.serialize(system))
-    print("System serialized successfully.")
 
-    # Perform three minimization cycles
-    print("Starting minimization cycles...")
-    for i in range(1, 4):
-        pos = perform_minimization(system, pos, top, i)
+def minimize(system, topology, positions, opt: argparse.Namespace):
+    platform, properties = get_platform(opt.platform, opt.cuda, opt.opencl)
+    integrator = mm.VerletIntegrator(1.0 * u.femtoseconds)
+    simulation = app.Simulation(topology, system, integrator, platform, properties)
+    simulation.context.setPositions(positions)
 
-    # Save the final minimized state as sys_min.xml
-    print("Saving the final minimized state to sys_min.xml...")
-    integrator = mm.VerletIntegrator(0.001)  # Dummy integrator for state creation
-    platform = mm.Platform.getPlatformByName("CPU")  # Platform for state creation
-    simulation = app.Simulation(top, system, integrator, platform)
-    simulation.context.setPositions(pos)
-    state = simulation.context.getState(
-        getPositions=True, getVelocities=True, getForces=True, getEnergy=True
+    tolerance = opt.min_tolerance * u.kilojoule_per_mole / u.nanometer
+    for cycle in range(1, opt.min_cycles + 1):
+        LOGGER.info("Minimization cycle %d/%d", cycle, opt.min_cycles)
+        simulation.minimizeEnergy(tolerance=tolerance, maxIterations=opt.max_iterations)
+        state = simulation.context.getState(getEnergy=True)
+        energy = state.getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)
+        LOGGER.info("Potential energy after cycle %d: %.4f kcal/mol", cycle, energy)
+
+    return simulation.context.getState(
+        getPositions=True,
+        getVelocities=True,
+        getEnergy=True,
+        enforcePeriodicBox=True,
     )
 
-    with open("sys_min.xml", "w") as f:
-        f.write(mm.XmlSerializer.serialize(state))
 
-        print("Final minimized state saved as sys_min.xml.")
+def main() -> None:
+    opt = parse_args()
+    setup_logging(opt.verbose)
+    system, topology, positions = build_system(opt)
+
+    LOGGER.info("Writing System XML: %s", opt.system_xml)
+    Path(opt.system_xml).write_text(mm.XmlSerializer.serialize(system))
+
+    state = minimize(system, topology, positions, opt)
+    LOGGER.info("Writing minimized State XML: %s", opt.min_state)
+    Path(opt.min_state).write_text(mm.XmlSerializer.serialize(state))
+    LOGGER.info("Done.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        LOGGER.error("Failed: %s", exc)
+        sys.exit(1)
