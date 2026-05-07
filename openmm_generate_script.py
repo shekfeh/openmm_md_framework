@@ -30,24 +30,55 @@ def ns_to_steps(ns: float, dt_fs: float) -> int:
 
 
 def cmd_lines(parts: list[str], indent: str = "  ") -> str:
-    """Return a multiline shell command with safe continuations.
-
-    Each continued line ends with exactly ' \\', i.e. a space before the
-    backslash. The final line has no backslash. Therefore a following 'fi'
-    can never be escaped into the command.
     """
+    Format shell command nicely:
+      --flag value pairs stay together
+      standalone flags stay standalone
+    """
+
     if not parts:
         raise ValueError("empty command")
-    lines: list[str] = []
-    for i, part in enumerate(parts):
-        suffix = " \\" if i < len(parts) - 1 else ""
-        lines.append(f"{indent}{part}{suffix}")
+
+    grouped = []
+    i = 0
+
+    while i < len(parts):
+        token = parts[i]
+
+        # standalone boolean flag
+        if token.startswith("-") and (
+            i + 1 >= len(parts) or parts[i + 1].startswith("-")
+        ):
+            grouped.append(token)
+            i += 1
+
+        # option + value pair
+        elif token.startswith("-") and i + 1 < len(parts):
+            grouped.append(f"{token} {parts[i + 1]}")
+            i += 2
+
+        # command/program
+        else:
+            grouped.append(token)
+            i += 1
+
+    if len(grouped) == 1:
+        return indent + grouped[0] + "\n"
+
+    lines = [indent + grouped[0] + " \\"]
+
+    for item in grouped[1:-1]:
+        lines.append(f"{indent}{item} \\")
+
+    lines.append(f"{indent}{grouped[-1]}")
+
     return "\n".join(lines) + "\n"
 
 
 def write_stage(f, title: str, target: str, parts: list[str]) -> None:
     f.write(f"\n# {title}\n")
     f.write(f"if [ ! -f {q(target)} ]; then\n")
+    f.write(f'  echo "Running: {title}"\n')
     f.write(cmd_lines(parts))
     f.write("fi\n")
 
@@ -67,14 +98,13 @@ def md_parts(
     interval: int,
     npt: bool = False,
     k: float | None = None,
+    reset_velocities: bool = False,
 ) -> list[str]:
     parts = [
         "python",
         q(args.md_script),
         "--xml",
         "system.xml",
-        "-i",
-        q(args.inpcrd),
         "-t",
         q(args.prmtop),
         "-s",
@@ -101,10 +131,22 @@ def md_parts(
         q(dt),
         "--platform",
         q(args.platform),
-        "--cuda",
-        q(args.cuda),
     ]
-    if args.restrain_mask and args.reference and k is not None:
+
+    if args.platform == "CUDA":
+        parts += ["--cuda", q(args.cuda), "--cuda-precision", q(args.cuda_precision)]
+    elif args.platform == "OpenCL":
+        parts += ["--opencl", q(args.opencl)]
+
+    if args.write_restart_interval is not None:
+        parts += ["--write-restart-interval", q(args.write_restart_interval)]
+
+    if reset_velocities:
+        parts.append("--reset-velocities")
+
+    # Compatibility with openmm_md.py versions that accept restraint args.
+    # If your openmm_md.py only accepts but does not apply restraints, these are harmless.
+    if args.restrain_mask and args.reference and k is not None and k > 0:
         parts += [
             "--restrain-mask",
             q(args.restrain_mask),
@@ -113,8 +155,10 @@ def md_parts(
             "--reference",
             q(args.reference),
         ]
+
     if npt:
         parts.append("--npt")
+
     return parts
 
 
@@ -122,8 +166,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Generate a safer run_simulation.sh for OpenMM."
     )
+
     p.add_argument("-i", "--inpcrd", required=True, help="Amber inpcrd/rst7 file")
     p.add_argument("-t", "--prmtop", required=True, help="Amber prmtop file")
+
     p.add_argument(
         "phases",
         choices=["minim", "nvt", "npt", "md"],
@@ -135,96 +181,115 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--md-script", default="openmm_md.py")
     p.add_argument("--output", default="run_simulation.sh")
 
+    # Restraints
     p.add_argument("--reference", default="prot_amber.pdb")
     p.add_argument("--restrain-mask", default="!:WAT&!@H=")
     p.add_argument("--min-k", type=float, default=10.0)
     p.add_argument("--heat-k", type=float, default=10.0)
-    p.add_argument("--eq-k", type=float, default=2.5)
+    p.add_argument("--nvt-k", type=float, default=5.0)
+    p.add_argument("--npt-k", type=float, default=2.5)
+    p.add_argument("--relax1-k", type=float, default=2.5)
+    p.add_argument("--relax2-k", type=float, default=1.0)
+    p.add_argument("--relax3-k", type=float, default=0.25)
     p.add_argument("--restrain-production", action="store_true")
+    p.add_argument("--production-k", type=float, default=0.25)
 
+    # Safer defaults: production default is 1 fs.
     p.add_argument(
         "--dt",
         type=float,
-        default=2.0,
-        help="Default production/equilibration timestep in fs",
+        default=1.0,
+        help="Production timestep in fs. Default: 1.0. Use 2.0 only after stability is verified.",
     )
     p.add_argument(
         "--temp", type=float, default=298.15, help="Final target temperature in K"
     )
-    p.add_argument(
-        "--gamma-ln",
-        dest="gamma_ln",
-        type=float,
-        default=1.0,
-        help="Default Langevin friction 1/ps",
-    )
+    p.add_argument("--gamma-ln", dest="gamma_ln", type=float, default=1.0)
     p.add_argument("--interval", type=int, default=1000)
-    p.add_argument("--npt-interval", type=int, default=10000)
+    p.add_argument("--npt-interval", type=int, default=500)
+    p.add_argument(
+        "--write-restart-interval",
+        type=int,
+        default=None,
+        help="Forwarded to openmm_md.py. Default: not explicitly passed.",
+    )
+
+    # Platform
     p.add_argument("--platform", choices=["CUDA", "OpenCL", "CPU"], default="CUDA")
     p.add_argument("--cuda", default="0")
-
+    p.add_argument("--opencl", default="0")
     p.add_argument(
-        "--heating",
+        "--cuda-precision",
+        choices=["single", "mixed", "double"],
+        default="mixed",
+    )
+
+    # Heating
+    p.add_argument("--heating", action="store_true", default=True)
+    p.add_argument("--no-heating", action="store_false", dest="heating")
+    p.add_argument("--heat-temps", default="50,100,150,200,250")
+    p.add_argument("--heat-steps", type=int, default=50000)
+    p.add_argument("--heat-dt", type=float, default=0.5)
+    p.add_argument("--heat-gamma-ln", type=float, default=5.0)
+
+    # Main equilibration
+    p.add_argument("--min-time", type=float, default=0.025)
+    p.add_argument("--nvt-time", type=float, default=1.0)
+    p.add_argument("--nvt-dt", type=float, default=0.5)
+    p.add_argument("--nvt-gamma-ln", type=float, default=5.0)
+
+    p.add_argument("--npt-time", type=float, default=2.0)
+    p.add_argument("--npt-dt", type=float, default=0.5)
+    p.add_argument("--npt-gamma-ln", type=float, default=5.0)
+
+    # Extra relaxation after NPT, before production
+    p.add_argument(
+        "--md-relax",
         action="store_true",
         default=True,
-        help="Use gradual NVT heating before full NVT. Default: on",
+        help="Add production relaxation stages before production. Default: on.",
     )
-    p.add_argument(
-        "--no-heating",
-        action="store_false",
-        dest="heating",
-        help="Disable gradual heating",
-    )
-    p.add_argument(
-        "--heat-temps",
-        default="50,100,150,200,250",
-        help="Comma-separated heating temperatures before final temp",
-    )
-    p.add_argument(
-        "--heat-steps", type=int, default=50000, help="Steps per heating rung"
-    )
-    p.add_argument("--heat-dt", type=float, default=0.5, help="Heating timestep in fs")
-    p.add_argument(
-        "--heat-gamma-ln", type=float, default=5.0, help="Heating friction in 1/ps"
-    )
-    p.add_argument(
-        "--min-time",
-        type=float,
-        default=0.025,
-        help="Approximate minimization length equivalent in ns; kept for compatibility.",
-    )
-    p.add_argument(
-        "--nvt-time", type=float, default=1.0, help="Final NVT time after heating, ns"
-    )
-    p.add_argument(
-        "--npt-time", type=float, default=2.0, help="NPT equilibration time, ns"
-    )
-    p.add_argument(
-        "--md-time", type=float, default=10.0, help="Total production time, ns"
-    )
+    p.add_argument("--no-md-relax", action="store_false", dest="md_relax")
+    p.add_argument("--relax1-steps", type=int, default=50000)
+    p.add_argument("--relax1-dt", type=float, default=0.5)
+    p.add_argument("--relax1-gamma-ln", type=float, default=5.0)
+
+    p.add_argument("--relax2-steps", type=int, default=100000)
+    p.add_argument("--relax2-dt", type=float, default=1.0)
+    p.add_argument("--relax2-gamma-ln", type=float, default=2.0)
+
+    p.add_argument("--relax3-steps", type=int, default=100000)
+    p.add_argument("--relax3-dt", type=float, default=1.0)
+    p.add_argument("--relax3-gamma-ln", type=float, default=1.0)
+
+    # Production
+    p.add_argument("--md-time", type=float, default=10.0)
     p.add_argument("--prod-segments", type=int, default=5)
     p.add_argument("--skip-bash-check", action="store_true")
+
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     phases = set(args.phases)
+
     if args.prod_segments < 1:
         raise ValueError("--prod-segments must be >= 1")
 
-    heating_temps = []
+    heating_temps: list[float] = []
     if args.heating:
         heating_temps = [
             float(x.strip()) for x in args.heat_temps.split(",") if x.strip()
         ]
         heating_temps = [t for t in heating_temps if t < args.temp]
 
-    nvt_steps = ns_to_steps(args.nvt_time, args.dt)
-    npt_steps = ns_to_steps(args.npt_time, args.dt)
+    nvt_steps = ns_to_steps(args.nvt_time, args.nvt_dt)
+    npt_steps = ns_to_steps(args.npt_time, args.npt_dt)
     prod_steps = ns_to_steps(args.md_time / args.prod_segments, args.dt)
 
     out = Path(args.output)
+
     with out.open("w") as f:
         f.write("#!/usr/bin/env bash\n")
         f.write("set -euo pipefail\n\n")
@@ -273,6 +338,7 @@ def main() -> None:
                         interval=min(args.interval, args.heat_steps),
                         npt=False,
                         k=args.heat_k,
+                        reset_velocities=(idx == 1),
                     )
                     write_stage(
                         f, f"NVT heating rung {idx}: {temp:g} K", out_state, parts
@@ -287,12 +353,13 @@ def main() -> None:
                 log="sys_NVT.log",
                 chk="sys_NVT.chk",
                 temp=args.temp,
-                gamma_ln=args.gamma_ln,
-                dt=args.dt,
+                gamma_ln=args.nvt_gamma_ln,
+                dt=args.nvt_dt,
                 steps=nvt_steps,
                 interval=args.interval,
                 npt=False,
-                k=args.eq_k,
+                k=args.nvt_k,
+                reset_velocities=False,
             )
             write_stage(
                 f, f"Final restrained NVT at {args.temp:g} K", "sys_NVT.xml", parts
@@ -308,19 +375,71 @@ def main() -> None:
                 log="sys_NPT.log",
                 chk="sys_NPT.chk",
                 temp=args.temp,
-                gamma_ln=args.gamma_ln,
-                dt=args.dt,
+                gamma_ln=args.npt_gamma_ln,
+                dt=args.npt_dt,
                 steps=npt_steps,
                 interval=args.npt_interval,
                 npt=True,
-                k=args.eq_k,
+                k=args.npt_k,
+                reset_velocities=False,
             )
             write_stage(f, "Restrained NPT equilibration", "sys_NPT.xml", parts)
             current_state = "sys_NPT.xml"
 
         if "md" in phases:
+            if args.md_relax:
+                relax_specs = [
+                    (
+                        "sys_md_relax_1.xml",
+                        "Production relaxation 1: 0.5 fs, high friction, restrained",
+                        args.relax1_steps,
+                        args.relax1_dt,
+                        args.relax1_gamma_ln,
+                        args.relax1_k,
+                    ),
+                    (
+                        "sys_md_relax_2.xml",
+                        "Production relaxation 2: 1.0 fs, medium friction, weak restraint",
+                        args.relax2_steps,
+                        args.relax2_dt,
+                        args.relax2_gamma_ln,
+                        args.relax2_k,
+                    ),
+                    (
+                        "sys_md_relax_3.xml",
+                        "Production relaxation 3: 1.0 fs, production friction, very weak restraint",
+                        args.relax3_steps,
+                        args.relax3_dt,
+                        args.relax3_gamma_ln,
+                        args.relax3_k,
+                    ),
+                ]
+
+                for idx, (out_state, title, steps, dt, gamma_ln, k) in enumerate(
+                    relax_specs, start=1
+                ):
+                    parts = md_parts(
+                        args,
+                        state_in=current_state,
+                        restart=out_state,
+                        traj=out_state.replace(".xml", ".dcd"),
+                        log=out_state.replace(".xml", ".log"),
+                        chk=out_state.replace(".xml", ".chk"),
+                        temp=args.temp,
+                        gamma_ln=gamma_ln,
+                        dt=dt,
+                        steps=steps,
+                        interval=min(args.interval, steps),
+                        npt=True,
+                        k=k,
+                        reset_velocities=False,
+                    )
+                    write_stage(f, title, out_state, parts)
+                    current_state = out_state
+
             for i in range(1, args.prod_segments + 1):
                 out_state = f"sys_md_{i}.xml"
+                k = args.production_k if args.restrain_production else None
                 parts = md_parts(
                     args,
                     state_in=current_state,
@@ -334,9 +453,15 @@ def main() -> None:
                     steps=prod_steps,
                     interval=args.interval,
                     npt=True,
-                    k=args.eq_k if args.restrain_production else None,
+                    k=k,
+                    reset_velocities=False,
                 )
-                write_stage(f, f"Production MD segment {i}", out_state, parts)
+                write_stage(
+                    f,
+                    f"Production MD segment {i}: dt={args.dt:g} fs",
+                    out_state,
+                    parts,
+                )
                 current_state = out_state
 
         f.write('\necho "Finished at $(date)"\n')
@@ -352,6 +477,11 @@ def main() -> None:
 
     print(f"Wrote {out}")
     print("Syntax check: OK")
+    print(f"Production dt: {args.dt:g} fs")
+    if args.dt > 1.0:
+        print(
+            "WARNING: production dt > 1 fs. Use only if your system is stable with constraints/HMR."
+        )
 
 
 if __name__ == "__main__":
