@@ -2,7 +2,7 @@
 
 Small workflow for running OpenMM simulations starting from Amber `prmtop` and `inpcrd/rst7` files.
 
-The cleaned workflow has three scripts:
+The workflow has three scripts:
 
 | Script | Purpose |
 |---|---|
